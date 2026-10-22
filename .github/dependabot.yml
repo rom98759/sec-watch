@@ -1,0 +1,9 @@
+# Add an entry per ecosystem used by the project (npm, pip, docker, ...)
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci
