@@ -1,0 +1,65 @@
+name: sec-watch
+
+x-hardening: &hardening
+  restart: unless-stopped
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+
+services:
+  # Only GET on containers/images reaches the Docker daemon: neither diun nor
+  # trivy can start, stop or exec anything even if compromised.
+  socket-proxy:
+    <<: *hardening
+    image: tecnativa/docker-socket-proxy:v0.5.0
+    environment:
+      CONTAINERS: 1
+      IMAGES: 1
+      POST: 0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    tmpfs:
+      - /run
+      - /tmp   # entrypoint renders haproxy.cfg here
+    networks: [docker-api]
+
+  diun:
+    <<: *hardening
+    image: crazymax/diun:4.33.0
+    command: serve
+    depends_on: [socket-proxy]
+    environment:
+      TZ: ${TZ:-Europe/Paris}
+      LOG_LEVEL: info
+      DIUN_WATCH_SCHEDULE: "0 */6 * * *"
+      DIUN_WATCH_JITTER: 30s
+      DIUN_WATCH_FIRSTCHECKNOTIF: "false"
+      DIUN_PROVIDERS_DOCKER: "true"
+      DIUN_PROVIDERS_DOCKER_ENDPOINT: tcp://socket-proxy:2375
+      DIUN_PROVIDERS_DOCKER_WATCHBYDEFAULT: "true"
+      DIUN_NOTIF_DISCORD_WEBHOOKURL: ${DISCORD_WEBHOOK_URL:?set DISCORD_WEBHOOK_URL in .env}
+      DIUN_NOTIF_DISCORD_RENDERFIELDS: "true"
+    volumes:
+      - diun-data:/data
+    networks: [docker-api, egress]
+
+  watcher:
+    <<: *hardening
+    build: ./watcher
+    image: sec-watch-watcher:local
+    depends_on: [socket-proxy]
+    env_file: .env
+    environment:
+      DOCKER_HOST: tcp://socket-proxy:2375
+    volumes:
+      - watcher-data:/data
+    networks: [docker-api, egress]
+
+volumes:
+  diun-data:      # diun image digest database
+  watcher-data:   # state.json (already-notified findings) + trivy vulnerability DB cache
+
+networks:
+  docker-api:
+    internal: true
+  egress: {}

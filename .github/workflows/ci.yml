@@ -20,4 +20,21 @@ jobs:
           docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:v8.30.1
           git /repo --redact --no-banner --verbose
 
-  # Add project jobs here (lint, test, build).
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: unit tests
+        working-directory: watcher
+        run: python3 -m unittest -v
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: hadolint
+        run: docker run --rm -i hadolint/hadolint:v2.15.1 < watcher/Dockerfile
+      - name: compose config
+        run: DISCORD_WEBHOOK_URL=https://example.invalid docker compose config -q
+      - name: build
+        run: docker build -q -t sec-watch-watcher:ci watcher

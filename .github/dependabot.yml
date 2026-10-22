@@ -1,4 +1,3 @@
-# Add an entry per ecosystem used by the project (npm, pip, docker, ...)
 version: 2
 updates:
   - package-ecosystem: github-actions
@@ -7,3 +6,17 @@ updates:
       interval: weekly
     commit-message:
       prefix: ci
+
+  - package-ecosystem: docker
+    directory: /watcher
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: build
+
+  - package-ecosystem: docker-compose
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: build
