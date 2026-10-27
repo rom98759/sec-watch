@@ -9,8 +9,14 @@ Self-hosted security watch for a single Docker host. It posts to one Discord cha
 | Running containers | Weekly summary of all open fixable CVEs (Mondays) | Trivy |
 | GitHub repositories | A new Dependabot security alert is opened | GitHub API |
 | GitHub repositories | Dependabot opens a pull request | GitHub API |
+| GitHub repositories | A Dependabot PR is merged or closed, alerts get resolved | GitHub API |
 
 Only new findings are notified; the state is kept in a named volume.
+
+GitHub findings arrive as one Discord card per repository: severity counts, most affected
+packages, clickable Dependabot PRs and the patched version of packages no PR covers.
+
+**Status:** working, runs on my own VPS. Python stdlib only, Docker Compose.
 
 ## Design
 

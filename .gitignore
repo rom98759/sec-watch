@@ -17,3 +17,6 @@ coverage/
 
 # Logs
 *.log
+
+# Local planning notes
+docs/superpowers/
