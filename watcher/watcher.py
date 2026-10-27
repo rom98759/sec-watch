@@ -419,6 +419,9 @@ def main() -> int:
 
     if args.once:
         if args.once == "github":
+            if not cfg.github_token:
+                log.error("GITHUB_TOKEN not set")
+                return 1
             run_github(cfg, state)
         else:
             run_trivy(cfg, state, weekly=args.once == "weekly")
