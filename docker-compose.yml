@@ -25,7 +25,7 @@ services:
 
   diun:
     <<: *hardening
-    image: crazymax/diun:4.33.0
+    image: crazymax/diun:4.33.1
     command: serve
     depends_on: [socket-proxy]
     environment:
