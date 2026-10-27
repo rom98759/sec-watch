@@ -16,7 +16,7 @@ Only new findings are notified; the state is kept in a named volume.
 GitHub findings arrive as one Discord card per repository: severity counts, most affected
 packages, clickable Dependabot PRs and the patched version of packages no PR covers.
 
-**Status:** working, runs on my own VPS. Python stdlib only, Docker Compose.
+**Status:** working, tested on a single Docker host. Python stdlib only, Docker Compose.
 
 ## Design
 
