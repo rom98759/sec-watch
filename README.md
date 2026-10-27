@@ -16,7 +16,13 @@ Only new findings are notified; the state is kept in a named volume.
 GitHub findings arrive as one Discord card per repository: severity counts, most affected
 packages, clickable Dependabot PRs and the patched version of packages no PR covers.
 
-**Status:** working, tested on a single Docker host. Python stdlib only, Docker Compose.
+| First run: one card per repository | Afterwards: only what changed |
+|---|---|
+| <img src="docs/screenshots/startup-overview.png" alt="Startup summary and repository card" width="420"> | <img src="docs/screenshots/change-cards.png" alt="New alert and merged PR cards" width="420"> |
+
+<sub>Screenshots use fictional repositories.</sub>
+
+**Status:** running on my own VPS. Python stdlib only, Docker Compose.
 
 ## Design
 
