@@ -35,6 +35,7 @@ jobs:
       - name: hadolint
         run: docker run --rm -i hadolint/hadolint:v2.15.1 < watcher/Dockerfile
       - name: compose config
-        run: DISCORD_WEBHOOK_URL=https://example.invalid docker compose config -q
+        # .env is never committed; the example has the same keys
+        run: cp .env.example .env && DISCORD_WEBHOOK_URL=https://example.invalid docker compose config -q
       - name: build
         run: docker build -q -t sec-watch-watcher:ci watcher

@@ -143,30 +143,102 @@ class ScheduleTest(unittest.TestCase):
         self.assertFalse(github)
 
 
+def alert(repo: str, number: int, severity: str = "HIGH", package: str = "next") -> w.Alert:
+    return w.Alert(repo, number, severity, package, f"bug {number}", f"https://gh/{repo}/a/{number}")
+
+
+def pr(repo: str, number: int, title: str = "Bump next from 14 to 15", body: str = "") -> w.PullRequest:
+    return w.PullRequest(repo, number, title, body, f"https://gh/{repo}/pull/{number}")
+
+
+class RepoCardTest(unittest.TestCase):
+    def test_summary_card(self):
+        alerts = [alert("o/r", 1, "HIGH"), alert("o/r", 2, "CRITICAL"), alert("o/r", 3, "HIGH", "ws")]
+        card = w.repo_card("o/r", alerts, [pr("o/r", 7)])
+        self.assertEqual(card["title"], "o/r")
+        self.assertEqual(card["url"], "https://github.com/o/r/security/dependabot")
+        self.assertEqual(card["color"], w.SEVERITY_COLOR["CRITICAL"])
+        self.assertIn("1 critical", card["description"])
+        self.assertIn("2 high", card["description"])
+        self.assertIn("`next` (2)", card["description"])
+        self.assertIn("[#7 Bump next from 14 to 15](https://gh/o/r/pull/7)", card["description"])
+        # ws has no Dependabot PR mentioning it
+        self.assertIn("No open PR for: `ws`", card["description"])
+
+    def test_package_named_in_grouped_pr_body_counts_as_covered(self):
+        grouped = pr("o/r", 8, "Bump the npm group with 2 updates", "Bumps [ws](https://x) and next")
+        card = w.repo_card("o/r", [alert("o/r", 1, package="ws")], [grouped])
+        self.assertNotIn("No open PR", card["description"])
+
+    def test_package_names_grouped_case_insensitively(self):
+        card = w.repo_card("o/r", [alert("o/r", 1, package="Pillow"), alert("o/r", 2, package="pillow")], [])
+        self.assertIn("`Pillow` (2)", card["description"])
+        self.assertNotIn("`pillow`", card["description"])
+
+    def test_link_text_is_escaped(self):
+        card = w.repo_card("o/r", [], [pr("o/r", 1, "Bump [x] from 1 to 2")])
+        self.assertIn(r"\[x\]", card["description"])
+
+
+class BatchEmbedsTest(unittest.TestCase):
+    def test_limits(self):
+        embeds = [{"title": "t", "description": "d" * 1000} for _ in range(25)]
+        batches = w.batch_embeds(embeds)
+        self.assertEqual(sum(len(b) for b in batches), 25)
+        for b in batches:
+            self.assertLessEqual(len(b), 10)
+            self.assertLessEqual(sum(len(e["title"]) + len(e["description"]) for e in b), 6000)
+
+
 class GithubDiffTest(unittest.TestCase):
     def setUp(self):
-        self.sent: list[list[str]] = []
-        self._orig_notify, self._orig_fetch = w.notify, w.fetch_github
-        w.notify = lambda cfg, lines: self.sent.append(lines)
+        self.sent: list[list[dict]] = []
+        self._orig = (w.send_embeds, w.fetch_github, w.fetch_pr_state)
+        w.send_embeds = lambda cfg, embeds: self.sent.append(embeds)
 
     def tearDown(self):
-        w.notify, w.fetch_github = self._orig_notify, self._orig_fetch
+        w.send_embeds, w.fetch_github, w.fetch_pr_state = self._orig
 
-    def test_bootstrap_then_only_new(self):
+    def fetch(self, alerts, prs):
+        w.fetch_github = lambda cfg: ({a.key: a for a in alerts}, {p.key: p for p in prs}, 3)
+
+    def test_bootstrap_one_card_per_repo_worst_first(self):
+        self.fetch([alert("o/low", 1, "MEDIUM"), alert("o/bad", 1, "CRITICAL")], [pr("o/pr", 1)])
+        w.run_github(make_cfg(), w.State())
+        embeds = self.sent[0]
+        self.assertIn("watch started", embeds[0]["title"])
+        self.assertEqual([e["title"] for e in embeds[1:]], ["o/bad", "o/low", "o/pr"])
+
+    def test_bootstrap_then_only_changes(self):
         state = w.State()
-        w.fetch_github = lambda cfg: ({"r#1": "alert1"}, {"r#2": "pr2"}, 3)
+        self.fetch([alert("o/r", 1)], [pr("o/r", 2)])
         w.run_github(make_cfg(), state)
-        self.assertEqual(len(self.sent), 1)
-        self.assertIn("watch started", self.sent[0][0])
-
         self.sent.clear()
         w.run_github(make_cfg(), state)
         self.assertEqual(self.sent, [])
 
-        w.fetch_github = lambda cfg: ({"r#1": "alert1", "r#9": "alert9"}, {"r#2": "pr2"}, 3)
+        self.fetch([alert("o/r", 1), alert("o/r", 9, "CRITICAL")], [pr("o/r", 2)])
         w.run_github(make_cfg(), state)
-        self.assertEqual(len(self.sent), 1)
-        self.assertEqual(self.sent[0][1:], ["alert9"])
+        (card,) = self.sent[0]
+        self.assertEqual(card["color"], w.SEVERITY_COLOR["CRITICAL"])
+        self.assertIn("https://gh/o/r/a/9", card["description"])
+        self.assertNotIn("https://gh/o/r/a/1", card["description"])
+
+    def test_merged_pr_and_resolved_alerts(self):
+        state = w.State()
+        self.fetch([alert("o/r", 1), alert("o/r", 2)], [pr("o/r", 5)])
+        w.run_github(make_cfg(), state)
+        self.sent.clear()
+
+        w.fetch_pr_state = lambda cfg, key: "merged"
+        self.fetch([alert("o/r", 2)], [])
+        w.run_github(make_cfg(), state)
+        (card,) = self.sent[0]
+        self.assertEqual(card["color"], w.MERGED_COLOR)
+        self.assertIn("Merged", card["description"])
+        self.assertIn("[#5](https://github.com/o/r/pull/5)", card["description"])
+        self.assertIn("1 alert resolved", card["description"])
+        self.assertIn("1 still open", card["description"])
 
 
 class TrivyRunTest(unittest.TestCase):
