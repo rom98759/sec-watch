@@ -264,6 +264,15 @@ class StateTest(unittest.TestCase):
             self.assertEqual(loaded.trivy_last_scan, "2026-10-22")
             self.assertEqual(loaded.github_alerts, ["a#1"])
 
+    def test_dry_run_never_persists(self):
+        # a dry run sharing the volume must not mark findings as already notified
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "state.json"
+            w.persist(make_cfg(state_file=p, dry_run=True), w.State(github_bootstrapped=True))
+            self.assertFalse(p.exists())
+            w.persist(make_cfg(state_file=p, dry_run=False), w.State(github_bootstrapped=True))
+            self.assertTrue(w.State.load(p).github_bootstrapped)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -99,6 +99,13 @@ class State:
         os.replace(tmp.name, path)
 
 
+def persist(cfg: Config, state: State) -> None:
+    # dry runs share the data volume with the real service: saving would mark
+    # findings as notified and the real run would never send them
+    if not cfg.dry_run:
+        state.save(cfg.state_file)
+
+
 # --- Discord -----------------------------------------------------------------
 
 
@@ -425,7 +432,7 @@ def main() -> int:
             run_github(cfg, state)
         else:
             run_trivy(cfg, state, weekly=args.once == "weekly")
-        state.save(cfg.state_file)
+        persist(cfg, state)
         return 0
 
     if not cfg.github_token:
@@ -436,14 +443,14 @@ def main() -> int:
         github_due, trivy_due, weekly_due = due_tasks(cfg, state, dt.datetime.now())
         if github_due:
             run_task("github check", lambda: run_github(cfg, state), cfg)
-            state.save(cfg.state_file)
+            persist(cfg, state)
         if trivy_due:
             run_task("trivy scan", lambda: run_trivy(cfg, state, weekly=weekly_due), cfg)
             # Mark the day as done even on failure to avoid re-scanning every minute.
             state.trivy_last_scan = dt.date.today().isoformat()
             if weekly_due:
                 state.trivy_last_weekly = state.trivy_last_scan
-            state.save(cfg.state_file)
+            persist(cfg, state)
         time.sleep(60)
 
 
