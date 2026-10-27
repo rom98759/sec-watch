@@ -25,7 +25,7 @@ from pathlib import Path
 log = logging.getLogger("sec-watch")
 
 SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "UNKNOWN": 4}
-SEVERITY_ICON = {"CRITICAL": "🟥", "HIGH": "🟧", "MEDIUM": "🟨", "LOW": "⬜", "UNKNOWN": "⬜"}
+SEVERITY_ICON = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "⚪", "UNKNOWN": "⚪"}
 SEVERITY_COLOR = {"CRITICAL": 0xE5484D, "HIGH": 0xF76B15, "MEDIUM": 0xFFC53D, "LOW": 0x8B8D98, "UNKNOWN": 0x8B8D98}
 MERGED_COLOR = 0x8957E5
 RESOLVED_COLOR = 0x2EA043
@@ -35,6 +35,7 @@ DISCORD_LIMIT = 2000
 EMBEDS_PER_MESSAGE = 10
 EMBEDS_TOTAL_LIMIT = 6000
 EMBED_DESCRIPTION_LIMIT = 4096
+FIELD_VALUE_LIMIT = 1024
 MAX_LINES_PER_IMAGE = 15
 MAX_LINKS_PER_CARD = 5
 
@@ -166,7 +167,9 @@ def notify(cfg: Config, lines: list[str]) -> None:
 
 
 def embed_size(embed: dict) -> int:
-    return len(embed.get("title", "")) + len(embed.get("description", ""))
+    fields = sum(len(f["name"]) + len(f["value"]) for f in embed.get("fields", []))
+    footer = len(embed.get("footer", {}).get("text", ""))
+    return len(embed.get("title", "")) + len(embed.get("description", "")) + fields + footer
 
 
 def batch_embeds(embeds: list[dict]) -> list[list[dict]]:
@@ -188,6 +191,10 @@ def batch_embeds(embeds: list[dict]) -> list[list[dict]]:
 def render_embed(embed: dict) -> str:
     lines = [f"┃ {embed['title']} <{embed.get('url', '')}>"]
     lines += [f"┃ {line}" for line in embed.get("description", "").splitlines()]
+    for f in embed.get("fields", []):
+        lines += ["┃", f"┃ **{f['name']}**", *(f"┃ {line}" for line in f["value"].splitlines())]
+    if footer := embed.get("footer", {}).get("text"):
+        lines += ["┃", f"┃ {footer}"]
     return "\n".join(lines)
 
 
@@ -381,6 +388,7 @@ class Alert:
     package: str
     summary: str
     url: str
+    patched: str = ""
 
     @property
     def key(self) -> str:
@@ -431,8 +439,9 @@ def fetch_github(cfg: Config) -> tuple[dict[str, Alert], dict[str, PullRequest],
         try:
             for a in gh_get_all(cfg, f"/repos/{name}/dependabot/alerts?state=open&per_page=100"):
                 adv = a["security_advisory"]
+                patched = (a.get("security_vulnerability") or {}).get("first_patched_version") or {}
                 alert = Alert(name, a["number"], adv["severity"].upper(), a["dependency"]["package"]["name"],
-                              adv["summary"], a["html_url"])  # fmt: skip
+                              adv["summary"], a["html_url"], patched.get("identifier", ""))  # fmt: skip
                 alerts[alert.key] = alert
         except urllib.error.HTTPError as e:
             # 403/404: Dependabot alerts disabled or not granted to the token
@@ -452,30 +461,57 @@ def fetch_pr_state(cfg: Config, key: str) -> str:
 
 # --- GitHub cards --------------------------------------------------------------
 
+BUMP_ONE = re.compile(r"bump (\S+) from (\S+) to (\S+)", re.IGNORECASE)
+BUMP_GROUP = re.compile(r"bump the (\S+) group.*?with (\d+) updates?", re.IGNORECASE)
+
 
 def md_link(text: str, url: str) -> str:
     escaped = text.replace("\\", "\\\\").replace("[", r"\[").replace("]", r"\]")
     return f"[{escaped}]({url})"
 
 
-def plural(n: int, word: str) -> str:
-    return f"{n} {word}{'s' if n != 1 else ''}"
+def plural(n: int, singular: str, plural_form: str | None = None) -> str:
+    return f"{n} {singular if n == 1 else plural_form or singular + 's'}"
+
+
+def version_key(version: str) -> tuple[int, ...]:
+    return tuple(int(n) for n in re.findall(r"\d+", version))
 
 
 def worst_severity(alerts: list[Alert]) -> str | None:
     return min((a.severity for a in alerts), key=lambda s: SEVERITY_ORDER.get(s, 9), default=None)
 
 
-def severity_counts(alerts: list[Alert]) -> str:
+def severity_lines(alerts: list[Alert]) -> list[str]:
     counts: dict[str, int] = {}
     for a in alerts:
         counts[a.severity] = counts.get(a.severity, 0) + 1
     ordered = sorted(counts, key=lambda s: SEVERITY_ORDER.get(s, 9))
-    return " · ".join(f"{SEVERITY_ICON.get(s, '')} {counts[s]} {s.lower()}" for s in ordered)
+    return [f"{SEVERITY_ICON.get(s, '')} {s.capitalize()} **{counts[s]}**" for s in ordered]
 
 
-def with_more(lines: list[str], limit: int = MAX_LINKS_PER_CARD) -> list[str]:
-    return lines[:limit] + ([f"… +{len(lines) - limit} more"] if len(lines) > limit else [])
+def fit(lines: list[str], max_lines: int = MAX_LINKS_PER_CARD, limit: int = FIELD_VALUE_LIMIT) -> str:
+    """Join lines, ending with "… +N" when they exceed the line count or Discord's field size."""
+    shown: list[str] = []
+    for line in lines[:max_lines]:
+        if len("\n".join([*shown, line])) > limit - 12:  # keep room for the "… +N" line
+            break
+        shown.append(line)
+    if len(shown) < len(lines):
+        shown.append(f"… +{len(lines) - len(shown)}")
+    return "\n".join(shown)
+
+
+def short_pr_title(title: str) -> str:
+    if m := BUMP_ONE.search(title):
+        return f"{m[1]} {m[2]} → {m[3]}"
+    if m := BUMP_GROUP.search(title):
+        return f"groupe {m[1]} · {plural(int(m[2]), 'paquet')}"
+    return re.sub(r"^\w+(\([\w-]+\))?: ", "", title)[:80]
+
+
+def pr_line(pr: PullRequest) -> str:
+    return md_link(f"#{pr.number} {short_pr_title(pr.title)}", pr.url)
 
 
 def covered_by_pr(package: str, prs: list[PullRequest]) -> bool:
@@ -484,36 +520,59 @@ def covered_by_pr(package: str, prs: list[PullRequest]) -> bool:
     return any(pattern.search(f"{p.title}\n{p.body}") for p in prs)
 
 
-def card(title: str, url: str, color: int, lines: list[str]) -> dict:
-    return {"title": title[:256], "url": url, "color": color,
-            "description": "\n".join(lines)[:EMBED_DESCRIPTION_LIMIT]}  # fmt: skip
+def package_stats(alerts: list[Alert]) -> list[tuple[str, int, str]]:
+    """Return (name, alert count, highest patched version) per package, most affected first."""
+    # pip names are case-insensitive: "Pillow" and "pillow" are one package
+    stats: dict[str, list] = {}
+    for a in alerts:
+        entry = stats.setdefault(a.package.lower(), [a.package, 0, ""])
+        entry[1] += 1
+        if a.patched and version_key(a.patched) > version_key(entry[2]):
+            entry[2] = a.patched
+    return sorted((tuple(e) for e in stats.values()), key=lambda e: -e[1])  # type: ignore[misc]
+
+
+def field(name: str, value: str, inline: bool = False) -> dict:
+    # Discord rejects empty field values
+    return {"name": name[:256], "value": value or "—", "inline": inline}
+
+
+def card(title: str, url: str, color: int, fields: list[dict], footer: str, description: str = "") -> dict:
+    embed = {
+        "title": title[:256],
+        "url": url,
+        "color": color,
+        "fields": fields[:25],
+        "footer": {"text": footer[:2048]},
+        "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
+    }
+    if description:
+        embed["description"] = description[:EMBED_DESCRIPTION_LIMIT]
+    return embed
 
 
 def security_url(repo: str) -> str:
     return f"https://github.com/{repo}/security/dependabot"
 
 
-def repo_card(repo: str, alerts: list[Alert], prs: list[PullRequest]) -> dict:
-    # pip names are case-insensitive: "Pillow" and "pillow" are one package
-    names: dict[str, str] = {}
-    by_package: dict[str, int] = {}
-    for a in alerts:
-        name = names.setdefault(a.package.lower(), a.package)
-        by_package[name] = by_package.get(name, 0) + 1
-    packages = sorted(by_package, key=lambda p: -by_package[p])
-
-    lines = [severity_counts(alerts) if alerts else "No open alert"]
-    if packages:
-        lines.append("Top: " + " · ".join(f"`{p}` ({by_package[p]})" for p in packages[:3]))
-    if prs:
-        lines.append("**Dependabot PRs**")
-        lines += with_more([md_link(f"#{p.number} {p.title}", p.url) for p in sorted(prs, key=lambda p: p.number)])
-    if uncovered := [p for p in packages if not covered_by_pr(p, prs)]:
-        names = ", ".join(f"`{p}`" for p in uncovered[:MAX_LINKS_PER_CARD])
-        extra = f" (+{len(uncovered) - MAX_LINKS_PER_CARD})" if len(uncovered) > MAX_LINKS_PER_CARD else ""
-        lines.append(f"⚠️ No open PR for: {names}{extra}")
+def severity_color(alerts: list[Alert]) -> int:
     worst = worst_severity(alerts)
-    return card(repo, security_url(repo), SEVERITY_COLOR[worst] if worst else NEUTRAL_COLOR, lines)
+    return SEVERITY_COLOR[worst] if worst else NEUTRAL_COLOR
+
+
+def repo_card(repo: str, alerts: list[Alert], prs: list[PullRequest]) -> dict:
+    stats = package_stats(alerts)
+    fields = [
+        field("Gravité", "\n".join(severity_lines(alerts)) or "Aucune alerte", inline=True),
+        field("Paquets touchés", fit([f"`{name}` ×{count}" for name, count, _ in stats]), inline=True),
+        field(f"🔀 PR Dependabot ({len(prs)})", fit([pr_line(p) for p in sorted(prs, key=lambda p: p.number)]) or "Aucune"),
+    ]
+    if uncovered := [s for s in stats if not covered_by_pr(s[0], prs)]:
+        lines = [f"`{name}` → {patched}" if patched else f"`{name}` (pas de version corrigée)"
+                 for name, _, patched in uncovered]  # fmt: skip
+        fields.append(field(f"🛠️ Sans correctif auto ({len(uncovered)})", fit(lines)))
+    footer = f"{plural(len(alerts), 'alerte')} · {plural(len(prs), 'PR', 'PR')}"
+    return card(repo, security_url(repo), severity_color(alerts), fields, footer)
 
 
 def update_card(
@@ -524,34 +583,58 @@ def update_card(
     resolved: int,
     still_open: int,
 ) -> dict:
-    lines: list[str] = []
+    fields: list[dict] = []
     if new_alerts:
-        lines.append(f"**🚨 {plural(len(new_alerts), 'new alert')}**")
         ordered = sorted(new_alerts, key=lambda a: SEVERITY_ORDER.get(a.severity, 9))
-        lines += with_more(
-            [f"{SEVERITY_ICON.get(a.severity, '')} {md_link(f'{a.package} — {a.summary[:90]}', a.url)}" for a in ordered],
-            MAX_LINES_PER_IMAGE,
-        )
+        lines = [
+            f"{SEVERITY_ICON.get(a.severity, '')} {md_link(f'{a.package} — {a.summary[:70]}', a.url)}"
+            + (f" → {a.patched}" if a.patched else "")
+            for a in ordered
+        ]
+        name = f"🚨 {plural(len(new_alerts), 'nouvelle alerte', 'nouvelles alertes')}"
+        fields.append(field(name, fit(lines, MAX_LINES_PER_IMAGE)))
     if new_prs:
-        lines.append(f"**🔧 {plural(len(new_prs), 'new Dependabot PR')}**")
-        lines += with_more([md_link(f"#{p.number} {p.title}", p.url) for p in new_prs])
-    for key, pr_state in closed_prs:
-        number = key.rsplit("#", 1)[1]
-        link = md_link(f"#{number}", f"https://github.com/{repo}/pull/{number}")
-        lines.append(f"🟣 Merged {link}" if pr_state == "merged" else f"⚪ Closed without merge {link}")
+        name = f"🔀 {plural(len(new_prs), 'nouvelle PR', 'nouvelles PR')}"
+        fields.append(field(name, fit([pr_line(p) for p in new_prs])))
+    if closed_prs:
+        lines = []
+        for key, pr_state in closed_prs:
+            number = key.rsplit("#", 1)[1]
+            link = md_link(f"#{number}", f"https://github.com/{repo}/pull/{number}")
+            lines.append(f"🟣 Mergée {link}" if pr_state == "merged" else f"⚪ Fermée sans merge {link}")
+        fields.append(field("📦 PR terminées", fit(lines)))
     if resolved:
-        lines.append(f"✅ {plural(resolved, 'alert')} resolved · {still_open} still open")
+        value = (f"{plural(resolved, 'alerte résolue', 'alertes résolues')} · "
+                 f"{plural(still_open, 'encore ouverte', 'encore ouvertes')}")  # fmt: skip
+        fields.append(field("✅ Résolues", value))
 
-    worst = worst_severity(new_alerts)
-    if worst:
-        color = SEVERITY_COLOR[worst]
+    if new_alerts:
+        color = severity_color(new_alerts)
     elif any(s == "merged" for _, s in closed_prs):
         color = MERGED_COLOR
     elif resolved:
         color = RESOLVED_COLOR
     else:
         color = NEUTRAL_COLOR
-    return card(repo, security_url(repo), color, lines)
+    footer = plural(still_open, "alerte ouverte", "alertes ouvertes")
+    return card(repo, security_url(repo), color, fields, footer)
+
+
+def header_card(repo_count: int, alerts_by_repo: dict[str, list[Alert]], pr_count: int) -> dict:
+    all_alerts = [a for repo_alerts in alerts_by_repo.values() for a in repo_alerts]
+    top = sorted(alerts_by_repo.items(), key=lambda kv: -len(kv[1]))
+    return card(
+        "🛡️ Veille GitHub démarrée",
+        "https://github.com/settings/security_analysis",
+        NEUTRAL_COLOR,
+        [
+            field("Gravité", "\n".join(severity_lines(all_alerts)) or "Aucune alerte", inline=True),
+            field("Dépôts les plus touchés", fit([f"{r.split('/')[-1]} ×{len(a)}" for r, a in top]), inline=True),
+        ],
+        "Une carte par dépôt ci-dessous, du plus grave au moins grave",
+        description=(f"**{repo_count}** dépôts surveillés · **{len(all_alerts)}** alertes ouvertes · "
+                     f"**{pr_count}** PR Dependabot"),  # fmt: skip
+    )
 
 
 def repo_of(key: str) -> str:
@@ -576,21 +659,14 @@ def run_github(cfg: Config, state: State) -> None:
         prs_by_repo.setdefault(p.repo, []).append(p)
 
     if not state.github_bootstrapped:
-        all_alerts = list(alerts.values())
-        header = card(
-            "🛡️ sec-watch: GitHub watch started",
-            "https://github.com/settings/security_analysis",
-            NEUTRAL_COLOR,
-            [f"{repo_count} repos · {plural(len(alerts), 'open alert')} · {plural(len(prs), 'Dependabot PR')}",
-             severity_counts(all_alerts) if all_alerts else "No open alert"],
-        )  # fmt: skip
 
         def rank(repo: str) -> tuple[int, int, str]:
             repo_alerts = alerts_by_repo.get(repo, [])
             return SEVERITY_ORDER.get(worst_severity(repo_alerts) or "", 9), -len(repo_alerts), repo
 
         repos = sorted(alerts_by_repo.keys() | prs_by_repo.keys(), key=rank)
-        send_embeds(cfg, [header] + [repo_card(r, alerts_by_repo.get(r, []), prs_by_repo.get(r, [])) for r in repos])
+        cards = [repo_card(r, alerts_by_repo.get(r, []), prs_by_repo.get(r, [])) for r in repos]
+        send_embeds(cfg, [header_card(repo_count, alerts_by_repo, len(prs)), *cards])
         state.github_bootstrapped = True
     else:
         known_alerts, known_prs = set(state.github_alerts), set(state.github_prs)

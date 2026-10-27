@@ -143,51 +143,86 @@ class ScheduleTest(unittest.TestCase):
         self.assertFalse(github)
 
 
-def alert(repo: str, number: int, severity: str = "HIGH", package: str = "next") -> w.Alert:
-    return w.Alert(repo, number, severity, package, f"bug {number}", f"https://gh/{repo}/a/{number}")
+def alert(repo: str, number: int, severity: str = "HIGH", package: str = "next", patched: str = "") -> w.Alert:
+    return w.Alert(repo, number, severity, package, f"bug {number}", f"https://gh/{repo}/a/{number}", patched)
 
 
 def pr(repo: str, number: int, title: str = "Bump next from 14 to 15", body: str = "") -> w.PullRequest:
     return w.PullRequest(repo, number, title, body, f"https://gh/{repo}/pull/{number}")
 
 
+def fields(embed: dict) -> dict[str, str]:
+    return {f["name"]: f["value"] for f in embed["fields"]}
+
+
 class RepoCardTest(unittest.TestCase):
     def test_summary_card(self):
-        alerts = [alert("o/r", 1, "HIGH"), alert("o/r", 2, "CRITICAL"), alert("o/r", 3, "HIGH", "ws")]
+        alerts = [alert("o/r", 1, "HIGH"), alert("o/r", 2, "CRITICAL"), alert("o/r", 3, "HIGH", "ws", "8.17.1")]
         card = w.repo_card("o/r", alerts, [pr("o/r", 7)])
+        f = fields(card)
         self.assertEqual(card["title"], "o/r")
         self.assertEqual(card["url"], "https://github.com/o/r/security/dependabot")
         self.assertEqual(card["color"], w.SEVERITY_COLOR["CRITICAL"])
-        self.assertIn("1 critical", card["description"])
-        self.assertIn("2 high", card["description"])
-        self.assertIn("`next` (2)", card["description"])
-        self.assertIn("[#7 Bump next from 14 to 15](https://gh/o/r/pull/7)", card["description"])
+        self.assertEqual(f["Gravité"], "🔴 Critical **1**\n🟠 High **2**")
+        self.assertEqual(f["Paquets touchés"], "`next` ×2\n`ws` ×1")
+        self.assertEqual(f["🔀 PR Dependabot (1)"], "[#7 next 14 → 15](https://gh/o/r/pull/7)")
         # ws has no Dependabot PR mentioning it
-        self.assertIn("No open PR for: `ws`", card["description"])
+        self.assertEqual(f["🛠️ Sans correctif auto (1)"], "`ws` → 8.17.1")
+        self.assertEqual(card["footer"]["text"], "3 alertes · 1 PR")
 
     def test_package_named_in_grouped_pr_body_counts_as_covered(self):
         grouped = pr("o/r", 8, "Bump the npm group with 2 updates", "Bumps [ws](https://x) and next")
         card = w.repo_card("o/r", [alert("o/r", 1, package="ws")], [grouped])
-        self.assertNotIn("No open PR", card["description"])
+        self.assertFalse(any(name.startswith("🛠️") for name in fields(card)))
 
     def test_package_names_grouped_case_insensitively(self):
         card = w.repo_card("o/r", [alert("o/r", 1, package="Pillow"), alert("o/r", 2, package="pillow")], [])
-        self.assertIn("`Pillow` (2)", card["description"])
-        self.assertNotIn("`pillow`", card["description"])
+        self.assertEqual(fields(card)["Paquets touchés"], "`Pillow` ×2")
+
+    def test_highest_patched_version_wins(self):
+        alerts = [alert("o/r", 1, package="vite", patched="6.2.10"), alert("o/r", 2, package="vite", patched="6.2.9")]
+        self.assertEqual(fields(w.repo_card("o/r", alerts, []))["🛠️ Sans correctif auto (1)"], "`vite` → 6.2.10")
 
     def test_link_text_is_escaped(self):
-        card = w.repo_card("o/r", [], [pr("o/r", 1, "Bump [x] from 1 to 2")])
-        self.assertIn(r"\[x\]", card["description"])
+        card = w.repo_card("o/r", [], [pr("o/r", 1, "Update [x]")])
+        self.assertIn(r"\[x\]", fields(card)["🔀 PR Dependabot (1)"])
+
+    def test_empty_values_are_never_sent(self):
+        card = w.repo_card("o/r", [], [])
+        self.assertTrue(all(f["value"] for f in card["fields"]))
+
+
+class ShortPrTitleTest(unittest.TestCase):
+    def test_single_bump(self):
+        title = "Bump nodemailer from 6.10.1 to 10.1.7 in /srcs/app in the npm_and_yarn group across 1 directory"
+        self.assertEqual(w.short_pr_title(title), "nodemailer 6.10.1 → 10.1.7")
+
+    def test_group_bump(self):
+        title = "chore(deps): bump the npm_and_yarn group across 2 directories with 19 updates"
+        self.assertEqual(w.short_pr_title(title), "groupe npm_and_yarn · 19 paquets")
+
+    def test_other_title_drops_conventional_prefix(self):
+        self.assertEqual(w.short_pr_title("build(deps-dev): update lockfile"), "update lockfile")
+
+
+class FitTest(unittest.TestCase):
+    def test_line_cap_adds_more_marker(self):
+        self.assertEqual(w.fit(["a", "b", "c"], max_lines=2), "a\nb\n… +1")
+
+    def test_respects_field_limit(self):
+        value = w.fit(["x" * 300] * 10, max_lines=10)
+        self.assertLessEqual(len(value), w.FIELD_VALUE_LIMIT)
+        self.assertTrue(value.endswith("… +7"))
 
 
 class BatchEmbedsTest(unittest.TestCase):
     def test_limits(self):
-        embeds = [{"title": "t", "description": "d" * 1000} for _ in range(25)]
+        embeds = [{"title": "t", "fields": [{"name": "n", "value": "d" * 1000}]} for _ in range(25)]
         batches = w.batch_embeds(embeds)
         self.assertEqual(sum(len(b) for b in batches), 25)
         for b in batches:
             self.assertLessEqual(len(b), 10)
-            self.assertLessEqual(sum(len(e["title"]) + len(e["description"]) for e in b), 6000)
+            self.assertLessEqual(sum(w.embed_size(e) for e in b), 6000)
 
 
 class GithubDiffTest(unittest.TestCase):
@@ -206,7 +241,8 @@ class GithubDiffTest(unittest.TestCase):
         self.fetch([alert("o/low", 1, "MEDIUM"), alert("o/bad", 1, "CRITICAL")], [pr("o/pr", 1)])
         w.run_github(make_cfg(), w.State())
         embeds = self.sent[0]
-        self.assertIn("watch started", embeds[0]["title"])
+        self.assertIn("Veille GitHub démarrée", embeds[0]["title"])
+        self.assertIn("**3** dépôts surveillés", embeds[0]["description"])
         self.assertEqual([e["title"] for e in embeds[1:]], ["o/bad", "o/low", "o/pr"])
 
     def test_bootstrap_then_only_changes(self):
@@ -217,12 +253,15 @@ class GithubDiffTest(unittest.TestCase):
         w.run_github(make_cfg(), state)
         self.assertEqual(self.sent, [])
 
-        self.fetch([alert("o/r", 1), alert("o/r", 9, "CRITICAL")], [pr("o/r", 2)])
+        self.fetch([alert("o/r", 1), alert("o/r", 9, "CRITICAL", patched="15.0.1")], [pr("o/r", 2)])
         w.run_github(make_cfg(), state)
         (card,) = self.sent[0]
         self.assertEqual(card["color"], w.SEVERITY_COLOR["CRITICAL"])
-        self.assertIn("https://gh/o/r/a/9", card["description"])
-        self.assertNotIn("https://gh/o/r/a/1", card["description"])
+        value = fields(card)["🚨 1 nouvelle alerte"]
+        self.assertIn("https://gh/o/r/a/9", value)
+        self.assertIn("→ 15.0.1", value)
+        self.assertNotIn("https://gh/o/r/a/1", value)
+        self.assertEqual(card["footer"]["text"], "2 alertes ouvertes")
 
     def test_merged_pr_and_resolved_alerts(self):
         state = w.State()
@@ -234,11 +273,10 @@ class GithubDiffTest(unittest.TestCase):
         self.fetch([alert("o/r", 2)], [])
         w.run_github(make_cfg(), state)
         (card,) = self.sent[0]
+        f = fields(card)
         self.assertEqual(card["color"], w.MERGED_COLOR)
-        self.assertIn("Merged", card["description"])
-        self.assertIn("[#5](https://github.com/o/r/pull/5)", card["description"])
-        self.assertIn("1 alert resolved", card["description"])
-        self.assertIn("1 still open", card["description"])
+        self.assertEqual(f["📦 PR terminées"], "🟣 Mergée [#5](https://github.com/o/r/pull/5)")
+        self.assertEqual(f["✅ Résolues"], "1 alerte résolue · 1 encore ouverte")
 
 
 class TrivyRunTest(unittest.TestCase):
