@@ -47,7 +47,7 @@ packages, clickable Dependabot PRs and the patched version of packages no PR cov
 - All containers run read-only, with every capability dropped and `no-new-privileges`.
 - No port is published, so nothing is reachable from outside (and ufw/`DOCKER-USER` need no change).
 - `watcher` is a single stdlib-only Python file: no third-party dependency to audit. Its image
-  ships without pip, and sec-watch scans itself: no fixable CRITICAL/HIGH CVE at release time.
+  ships without pip, and sec-watch scans itself like any other running image.
 
 ## Setup
 
