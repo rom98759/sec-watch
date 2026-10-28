@@ -29,7 +29,7 @@ TRIVY_REPORT = {
             "Vulnerabilities": [
                 {"VulnerabilityID": "CVE-2 ", "PkgName": "zlib", "Severity": "HIGH"},
                 {"VulnerabilityID": "CVE-1", "PkgName": "openssl", "InstalledVersion": "3.0",
-                 "FixedVersion": "3.1", "Severity": "CRITICAL", "Title": "bad"},
+                 "FixedVersion": "3.1", "Severity": "CRITICAL", "Title": "bad", "PrimaryURL": "https://avd/cve-1"},
             ]
         },
         # same CVE+pkg reported by two layers/targets must be counted once
@@ -53,19 +53,40 @@ class ParseTrivyTest(unittest.TestCase):
         fresh = w.new_findings(["CVE-1|openssl"], vulns)
         self.assertEqual([v.pkg for v in fresh], ["zlib"])
 
-    def test_count_by_severity(self):
-        self.assertEqual(w.count_by_severity(w.parse_trivy(TRIVY_REPORT)), "1 critical, 1 high")
-        self.assertEqual(w.count_by_severity([]), "clean")
+    def test_duplicate_keeps_the_entry_with_a_fix(self):
+        report = {"Results": [
+            {"Vulnerabilities": [{"VulnerabilityID": "CVE-1", "PkgName": "openssl", "Severity": "HIGH"}]},
+            {"Vulnerabilities": [{"VulnerabilityID": "CVE-1", "PkgName": "openssl", "Severity": "HIGH",
+                                  "FixedVersion": "3.1"}]},
+        ]}  # fmt: skip
+        self.assertEqual(w.parse_trivy(report)[0].fixed, "3.1")
+
+    def test_primary_url_kept(self):
+        self.assertEqual(w.parse_trivy(TRIVY_REPORT)[0].url, "https://avd/cve-1")
 
 
-class ChunkTest(unittest.TestCase):
-    def test_respects_limit(self):
-        chunks = w.chunk_message(["x" * 900] * 5, limit=2000)
-        self.assertTrue(all(len(c) <= 2000 for c in chunks))
-        self.assertEqual(sum(c.count("x") for c in chunks), 4500)
+def text(embeds: list[dict]) -> str:
+    return "\n".join(w.render_embed(e) for e in embeds)
 
-    def test_truncates_single_long_line(self):
-        self.assertTrue(len(w.chunk_message(["y" * 5000])[0]) <= 2000)
+
+class TrivyCardTest(unittest.TestCase):
+    def test_image_card(self):
+        card = w.image_card("app:1", w.parse_trivy(TRIVY_REPORT))
+        f = {x["name"]: x["value"] for x in card["fields"]}
+        self.assertEqual(card["title"], "app:1")
+        self.assertNotIn("url", card)
+        self.assertEqual(card["color"], w.SEVERITY_COLOR["CRITICAL"])
+        self.assertEqual(f["Gravité"], "🔴 Critical **1**\n🟠 High **1**")
+        self.assertEqual(f["🩹 CVE corrigeables (2)"].splitlines()[0], "🔴 [CVE-1](https://avd/cve-1) `openssl` 3.0 → 3.1")
+        self.assertEqual(card["footer"]["text"], "2 CVE corrigeables")
+
+    def test_summary_lists_clean_images_and_errors(self):
+        cards = w.scan_summary_cards("🐳 Premier scan Trivy", {"app:1": w.parse_trivy(TRIVY_REPORT), "db:1": []},
+                                     ["⚠️ `x:1`: boom"], "CRITICAL,HIGH")  # fmt: skip
+        header = {x["name"]: x["value"] for x in cards[0]["fields"]}
+        self.assertEqual(header["✅ Sans CVE (1)"], "`db:1`")
+        self.assertEqual(header["⚠️ Erreurs"], "⚠️ `x:1`: boom")
+        self.assertEqual([c["title"] for c in cards[1:]], ["app:1"])
 
 
 class LinkHeaderTest(unittest.TestCase):
@@ -282,13 +303,13 @@ class GithubDiffTest(unittest.TestCase):
 class TrivyRunTest(unittest.TestCase):
     def setUp(self):
         self.sent: list[list[str]] = []
-        self._orig = (w.notify, w.running_images, w.scan_image, w.update_trivy_db)
-        w.notify = lambda cfg, lines: self.sent.append(lines)
+        self._orig = (w.send_embeds, w.running_images, w.scan_image, w.update_trivy_db)
+        w.send_embeds = lambda cfg, embeds: self.sent.append(embeds)
         w.running_images = lambda cfg: ["app:1", "db:1"]
         w.update_trivy_db = lambda cfg: None
 
     def tearDown(self):
-        w.notify, w.running_images, w.scan_image, w.update_trivy_db = self._orig
+        w.send_embeds, w.running_images, w.scan_image, w.update_trivy_db = self._orig
 
     def test_db_failure_without_cache_aborts_scan(self):
         w.update_trivy_db = self._orig[3]
@@ -322,7 +343,7 @@ class TrivyRunTest(unittest.TestCase):
                 w.run_trivy(make_cfg(trivy_cache=Path(d)), state, weekly=False)
         finally:
             w._trivy = orig_trivy
-        self.assertIn("cached DB", "\n".join(self.sent[-1]))
+        self.assertIn("cached DB", text(self.sent[-1]))
 
     def test_failed_scan_keeps_previous_findings(self):
         state = w.State(trivy_bootstrapped=True, trivy_seen={"db:1": ["CVE-1|openssl"]})
@@ -335,22 +356,34 @@ class TrivyRunTest(unittest.TestCase):
         w.scan_image = scan
         w.run_trivy(make_cfg(), state, weekly=False)
         self.assertEqual(state.trivy_seen["db:1"], ["CVE-1|openssl"])
-        self.assertIn("could not be scanned", self.sent[-1][0])
+        self.assertIn("Scan incomplet", self.sent[-1][0]["title"])
+        self.assertIn("registry down", text(self.sent[-1]))
 
     def test_only_new_cves_are_sent(self):
         state = w.State(trivy_bootstrapped=True, trivy_seen={"app:1": ["CVE-1|openssl"]})
         w.scan_image = lambda cfg, image: w.parse_trivy(TRIVY_REPORT) if image == "app:1" else []
         w.run_trivy(make_cfg(), state, weekly=False)
-        self.assertEqual(len(self.sent), 1)
-        self.assertIn("zlib", self.sent[0][1])
+        (card,) = self.sent[0]
+        self.assertEqual(card["title"], "app:1")
+        self.assertIn("1 nouvelle CVE", text([card]))
+        self.assertIn("zlib", text([card]))
+        self.assertNotIn("openssl", text([card]))
+        self.assertEqual(card["footer"]["text"], "2 CVE corrigeables dans l'image")
 
     def test_first_run_sends_summary_only(self):
         state = w.State()
         w.scan_image = lambda cfg, image: w.parse_trivy(TRIVY_REPORT)
         w.run_trivy(make_cfg(), state, weekly=True)
         self.assertEqual(len(self.sent), 1)
-        self.assertIn("first Trivy scan", self.sent[0][0])
+        self.assertIn("Premier scan Trivy", self.sent[0][0]["title"])
         self.assertTrue(state.trivy_bootstrapped)
+
+    def test_weekly_summary_after_bootstrap(self):
+        state = w.State(trivy_bootstrapped=True, trivy_seen={"app:1": ["CVE-1|openssl", "CVE-2 |zlib"]})
+        w.scan_image = lambda cfg, image: w.parse_trivy(TRIVY_REPORT) if image == "app:1" else []
+        w.run_trivy(make_cfg(), state, weekly=True)
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("Résumé hebdo Trivy", self.sent[0][0]["title"])
 
     def test_first_run_all_failed_does_not_bootstrap(self):
         state = w.State()

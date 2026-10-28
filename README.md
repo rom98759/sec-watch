@@ -46,7 +46,8 @@ packages, clickable Dependabot PRs and the patched version of packages no PR cov
   containers and images; everything else (create, exec, volumes, secrets, any `POST`) gets `403`.
 - All containers run read-only, with every capability dropped and `no-new-privileges`.
 - No port is published, so nothing is reachable from outside (and ufw/`DOCKER-USER` need no change).
-- `watcher` is a single stdlib-only Python file: no third-party dependency to audit.
+- `watcher` is a single stdlib-only Python file: no third-party dependency to audit. Its image
+  ships without pip, and sec-watch scans itself: no fixable CRITICAL/HIGH CVE at release time.
 
 ## Setup
 

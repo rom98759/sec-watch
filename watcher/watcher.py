@@ -30,7 +30,6 @@ SEVERITY_COLOR = {"CRITICAL": 0xE5484D, "HIGH": 0xF76B15, "MEDIUM": 0xFFC53D, "L
 MERGED_COLOR = 0x8957E5
 RESOLVED_COLOR = 0x2EA043
 NEUTRAL_COLOR = 0x5865F2
-DISCORD_LIMIT = 2000
 # Discord caps: 10 embeds and 6000 characters per message, 4096 per description
 EMBEDS_PER_MESSAGE = 10
 EMBEDS_TOTAL_LIMIT = 6000
@@ -78,6 +77,7 @@ class Vuln:
     fixed: str
     severity: str
     title: str
+    url: str = ""
 
     @property
     def key(self) -> str:
@@ -120,21 +120,6 @@ def persist(cfg: Config, state: State) -> None:
 # --- Discord -----------------------------------------------------------------
 
 
-def chunk_message(lines: list[str], limit: int = DISCORD_LIMIT) -> list[str]:
-    chunks: list[str] = []
-    current = ""
-    for line in lines:
-        line = line[: limit - 1]
-        if current and len(current) + 1 + len(line) > limit:
-            chunks.append(current)
-            current = line
-        else:
-            current = f"{current}\n{line}" if current else line
-    if current:
-        chunks.append(current)
-    return chunks
-
-
 def post_discord(cfg: Config, payload: dict) -> None:
     payload = {**payload, "allowed_mentions": {"parse": []}}
     req = urllib.request.Request(
@@ -156,14 +141,6 @@ def post_discord(cfg: Config, payload: dict) -> None:
         except urllib.error.URLError as e:
             log.error("discord post failed: %s", e.reason)
             return
-
-
-def notify(cfg: Config, lines: list[str]) -> None:
-    for chunk in chunk_message(lines):
-        if cfg.dry_run or not cfg.discord_webhook:
-            print(f"--- discord (dry-run) ---\n{chunk}\n", flush=True)
-            continue
-        post_discord(cfg, {"content": chunk})
 
 
 def embed_size(embed: dict) -> int:
@@ -189,7 +166,8 @@ def batch_embeds(embeds: list[dict]) -> list[list[dict]]:
 
 
 def render_embed(embed: dict) -> str:
-    lines = [f"┃ {embed['title']} <{embed.get('url', '')}>"]
+    url = f" <{embed['url']}>" if embed.get("url") else ""
+    lines = [f"┃ {embed['title']}{url}"]
     lines += [f"┃ {line}" for line in embed.get("description", "").splitlines()]
     for f in embed.get("fields", []):
         lines += ["┃", f"┃ **{f['name']}**", *(f"┃ {line}" for line in f["value"].splitlines())]
@@ -234,8 +212,12 @@ def parse_trivy(report: dict) -> list[Vuln]:
                 fixed=v.get("FixedVersion", ""),
                 severity=v.get("Severity", "UNKNOWN"),
                 title=(v.get("Title") or "").strip(),
+                url=v.get("PrimaryURL", ""),
             )
-            vulns[vuln.key] = vuln
+            # several layers can report the same CVE, some without details: keep the one with a fix
+            known = vulns.get(vuln.key)
+            if known is None or (vuln.fixed and not known.fixed):
+                vulns[vuln.key] = vuln
     return sorted(vulns.values(), key=lambda x: (SEVERITY_ORDER.get(x.severity, 9), x.id))
 
 
@@ -279,20 +261,6 @@ def scan_image(cfg: Config, image: str) -> list[Vuln]:
     return parse_trivy(json.loads(out))
 
 
-def format_vuln(v: Vuln) -> str:
-    fix = f" → {v.fixed}" if v.fixed else ""
-    title = f" — {v.title[:80]}" if v.title else ""
-    return f"{SEVERITY_ICON.get(v.severity, '')} `{v.id}` {v.pkg} {v.installed}{fix}{title}"
-
-
-def count_by_severity(vulns: list[Vuln]) -> str:
-    counts: dict[str, int] = {}
-    for v in vulns:
-        counts[v.severity] = counts.get(v.severity, 0) + 1
-    parts = [f"{counts[s]} {s.lower()}" for s in SEVERITY_ORDER if s in counts]
-    return ", ".join(parts) if parts else "clean"
-
-
 def new_findings(seen: list[str], current: list[Vuln]) -> list[Vuln]:
     known = set(seen)
     return [v for v in current if v.key not in known]
@@ -317,27 +285,20 @@ def run_trivy(cfg: Config, state: State, weekly: bool) -> None:
             errors.append(f"⚠️ `{image}`: {e}")
 
     if first_run:
-        lines = [f"🛡️ **sec-watch: first Trivy scan** ({len(images)} images, fixable {cfg.severities})"]
-        lines += [f"• `{img}`: {count_by_severity(v)}" for img, v in results.items()]
-        notify(cfg, lines + errors)
+        send_embeds(cfg, scan_summary_cards("🐳 Premier scan Trivy", results, errors, cfg.severities))
     else:
+        cards = []
         for image, vulns in results.items():
-            fresh = new_findings(state.trivy_seen.get(image, []), vulns)
-            if not fresh:
-                continue
-            lines = [f"🚨 **New CVE in `{image}`** ({len(fresh)})"]
-            lines += [format_vuln(v) for v in fresh[:MAX_LINES_PER_IMAGE]]
-            if len(fresh) > MAX_LINES_PER_IMAGE:
-                lines.append(f"… +{len(fresh) - MAX_LINES_PER_IMAGE} more")
-            notify(cfg, lines)
+            if fresh := new_findings(state.trivy_seen.get(image, []), vulns):
+                cards.append(new_cve_card(image, fresh, len(vulns)))
         if errors:
-            notify(cfg, ["⚠️ **sec-watch: some images could not be scanned**", *errors])
+            cards.append(card("⚠️ Scan incomplet", "", SEVERITY_COLOR["LOW"], [field("Erreurs", fit(errors))],
+                              f"{len(results)} images scannées sur {len(images)}"))  # fmt: skip
+        if cards:
+            send_embeds(cfg, cards)
 
     if weekly and not first_run:
-        total = sum(len(v) for v in results.values())
-        lines = [f"📋 **Weekly security summary**: {len(images)} images, {total} fixable {cfg.severities}"]
-        lines += [f"• `{img}`: {count_by_severity(v)}" for img, v in results.items()]
-        notify(cfg, lines + errors)
+        send_embeds(cfg, scan_summary_cards("📋 Résumé hebdo Trivy", results, errors, cfg.severities))
 
     # Only running images are kept: removed containers stop being tracked.
     # A failed scan keeps its previous findings so they are not re-sent as new tomorrow.
@@ -478,11 +439,11 @@ def version_key(version: str) -> tuple[int, ...]:
     return tuple(int(n) for n in re.findall(r"\d+", version))
 
 
-def worst_severity(alerts: list[Alert]) -> str | None:
+def worst_severity(alerts: list[Alert] | list[Vuln]) -> str | None:
     return min((a.severity for a in alerts), key=lambda s: SEVERITY_ORDER.get(s, 9), default=None)
 
 
-def severity_lines(alerts: list[Alert]) -> list[str]:
+def severity_lines(alerts: list[Alert] | list[Vuln]) -> list[str]:
     counts: dict[str, int] = {}
     for a in alerts:
         counts[a.severity] = counts.get(a.severity, 0) + 1
@@ -538,14 +499,16 @@ def field(name: str, value: str, inline: bool = False) -> dict:
 
 
 def card(title: str, url: str, color: int, fields: list[dict], footer: str, description: str = "") -> dict:
-    embed = {
+    embed: dict = {
         "title": title[:256],
-        "url": url,
         "color": color,
         "fields": fields[:25],
         "footer": {"text": footer[:2048]},
         "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
     }
+    # Discord rejects an empty url
+    if url:
+        embed["url"] = url
     if description:
         embed["description"] = description[:EMBED_DESCRIPTION_LIMIT]
     return embed
@@ -555,7 +518,7 @@ def security_url(repo: str) -> str:
     return f"https://github.com/{repo}/security/dependabot"
 
 
-def severity_color(alerts: list[Alert]) -> int:
+def severity_color(alerts: list[Alert] | list[Vuln]) -> int:
     worst = worst_severity(alerts)
     return SEVERITY_COLOR[worst] if worst else NEUTRAL_COLOR
 
@@ -695,6 +658,66 @@ def run_github(cfg: Config, state: State) -> None:
     state.github_last_check = time.time()
 
 
+# --- Trivy cards ---------------------------------------------------------------
+
+
+def vuln_line(v: Vuln) -> str:
+    label = md_link(v.id, v.url) if v.url else f"`{v.id}`"
+    fix = f" → {v.fixed}" if v.fixed else ""
+    return f"{SEVERITY_ICON.get(v.severity, '')} {label} `{v.pkg}` {v.installed}{fix}"
+
+
+def image_card(image: str, vulns: list[Vuln]) -> dict:
+    by_package: dict[str, int] = {}
+    for v in vulns:
+        by_package[v.pkg] = by_package.get(v.pkg, 0) + 1
+    packages = sorted(by_package, key=lambda p: -by_package[p])
+    fields = [
+        field("Gravité", "\n".join(severity_lines(vulns)), inline=True),
+        field("Paquets touchés", fit([f"`{p}` ×{by_package[p]}" for p in packages]), inline=True),
+        field(f"🩹 CVE corrigeables ({len(vulns)})", fit([vuln_line(v) for v in vulns], MAX_LINES_PER_IMAGE)),
+    ]
+    footer = plural(len(vulns), "CVE corrigeable", "CVE corrigeables")
+    return card(image, "", severity_color(vulns), fields, footer)
+
+
+def new_cve_card(image: str, fresh: list[Vuln], total: int) -> dict:
+    name = f"🚨 {plural(len(fresh), 'nouvelle CVE', 'nouvelles CVE')}"
+    footer = f"{plural(total, 'CVE corrigeable', 'CVE corrigeables')} dans l'image"
+    return card(image, "", severity_color(fresh), [field(name, fit([vuln_line(v) for v in fresh], MAX_LINES_PER_IMAGE))],
+                footer)  # fmt: skip
+
+
+def scan_summary_cards(title: str, results: dict[str, list[Vuln]], errors: list[str], severities: str) -> list[dict]:
+    """Header card with totals, clean images and errors, then one card per image with CVEs."""
+    affected = {img: v for img, v in results.items() if v}
+    clean = sorted(img for img, v in results.items() if not v)
+    all_vulns = [v for vulns in affected.values() for v in vulns]
+    top = sorted(affected.items(), key=lambda kv: -len(kv[1]))
+    fields = [
+        field("Gravité", "\n".join(severity_lines(all_vulns)) or "Aucune CVE corrigeable", inline=True),
+        field("Images les plus touchées", fit([f"{img.split('/')[-1]} ×{len(v)}" for img, v in top]), inline=True),
+    ]
+    if clean:
+        fields.append(field(f"✅ Sans CVE ({len(clean)})", fit([f"`{img}`" for img in clean])))
+    if errors:
+        fields.append(field("⚠️ Erreurs", fit(errors)))
+    header = card(
+        title,
+        "",
+        NEUTRAL_COLOR,
+        fields,
+        f"Sévérités suivies : {severities} · uniquement les CVE avec un correctif",
+        description=f"**{len(results)}** images scannées · **{len(all_vulns)}** CVE corrigeables",
+    )
+
+    def rank(item: tuple[str, list[Vuln]]) -> tuple[int, int, str]:
+        img, vulns = item
+        return SEVERITY_ORDER.get(worst_severity(vulns) or "", 9), -len(vulns), img
+
+    return [header, *(image_card(img, v) for img, v in sorted(affected.items(), key=rank))]
+
+
 # --- Scheduling ----------------------------------------------------------------
 
 
@@ -712,7 +735,8 @@ def run_task(name: str, func, cfg: Config) -> None:
         func()
     except Exception as e:  # noqa: BLE001 - a failing task must not kill the loop
         log.exception("%s failed", name)
-        notify(cfg, [f"⚠️ **sec-watch: {name} failed**: `{type(e).__name__}: {str(e)[:300]}`"])
+        error = f"`{type(e).__name__}: {str(e)[:300]}`"
+        send_embeds(cfg, [card(f"⚠️ Échec : {name}", "", SEVERITY_COLOR["LOW"], [], "sec-watch", error)])
 
 
 def main() -> int:
