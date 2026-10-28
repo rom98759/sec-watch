@@ -1,6 +1,17 @@
 # sec-watch
 
-Self-hosted security watch for a single Docker host. It posts to one Discord channel when:
+[![CI](https://github.com/rom98759/sec-watch/actions/workflows/ci.yml/badge.svg)](https://github.com/rom98759/sec-watch/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/python-3.14-3776AB?logo=python&logoColor=white)
+![Dependencies](https://img.shields.io/badge/dependencies-stdlib%20only-2EA043)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
+Self-hosted security watch for a single Docker host: know when a running image gets a new
+fixable CVE, when an update is published, or when Dependabot finds something in your
+GitHub repositories, without opening five dashboards.
+
+**Status:** running on my own VPS. Python stdlib only, Docker Compose.
+
+It posts to one Discord channel when:
 
 | Source | Trigger | Tool |
 |---|---|---|
@@ -22,9 +33,7 @@ packages, clickable Dependabot PRs and the patched version of packages no PR cov
 
 <sub>Screenshots use fictional repositories.</sub>
 
-**Status:** running on my own VPS. Python stdlib only, Docker Compose.
-
-## Design
+## Security design
 
 ```
                  internal network (no internet)
@@ -79,6 +88,10 @@ docker compose run --rm watcher --once weekly
 ```bash
 cd watcher && python3 -m unittest -v
 ```
+
+CI runs the unit tests, [gitleaks](https://github.com/gitleaks/gitleaks) on the full history,
+[hadolint](https://github.com/hadolint/hadolint) on the Dockerfile, a Compose config check and
+an image build. Dependabot keeps the base images, Actions and Compose images up to date.
 
 ## License
 
