@@ -11,7 +11,7 @@ services:
   # trivy can start, stop or exec anything even if compromised.
   socket-proxy:
     <<: *hardening
-    image: tecnativa/docker-socket-proxy:v0.5.0
+    image: tecnativa/docker-socket-proxy:v0.6.0
     environment:
       CONTAINERS: 1
       IMAGES: 1
