@@ -508,7 +508,7 @@ class FetchGithubTest(unittest.TestCase):
                 "dependency": {"package": {"name": "pkg"}, "scope": scope}}
 
     def test_dev_scope_alerts_are_dropped_and_dismissed(self):
-        alerts, _, _ = w.fetch_github(make_cfg(dismiss_dev=True))
+        alerts, _, _ = w.fetch_github(make_cfg(dismiss_dev=True, dry_run=False))
         self.assertEqual(sorted(alerts), ["o/r#2", "o/r#3"])
         self.assertEqual(alerts["o/r#2"].cve, "CVE-2")
         self.assertEqual(self.dismissed, ["o/r#1"])
@@ -516,6 +516,10 @@ class FetchGithubTest(unittest.TestCase):
     def test_no_dismissal_unless_enabled(self):
         alerts, _, _ = w.fetch_github(make_cfg())
         self.assertEqual(sorted(alerts), ["o/r#2", "o/r#3"])
+        self.assertEqual(self.dismissed, [])
+
+    def test_dry_run_never_dismisses(self):
+        w.fetch_github(make_cfg(dismiss_dev=True, dry_run=True))
         self.assertEqual(self.dismissed, [])
 
 

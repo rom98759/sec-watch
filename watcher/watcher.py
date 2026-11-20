@@ -463,7 +463,7 @@ def fetch_github(cfg: Config) -> tuple[dict[str, Alert], dict[str, PullRequest],
                               adv["summary"], a["html_url"], patched.get("identifier", ""),
                               a["dependency"].get("scope") or "runtime", adv.get("cve_id") or "")  # fmt: skip
                 if is_noise(alert):
-                    if cfg.dismiss_dev:
+                    if cfg.dismiss_dev and not cfg.dry_run:
                         dismiss_alert(cfg, alert)
                     continue
                 alerts[alert.key] = alert
