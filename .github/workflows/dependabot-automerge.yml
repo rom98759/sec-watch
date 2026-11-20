@@ -1,0 +1,35 @@
+name: dependabot-automerge
+
+# Queues safe Dependabot PRs for auto-merge; branch protection makes the merge wait for green CI.
+on: pull_request
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  automerge:
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - id: meta
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+      - name: "Enable auto-merge for patch/minor (images: patch or digest only)"
+        env:
+          ECO: ${{ steps.meta.outputs.package-ecosystem }}
+          TYPE: ${{ steps.meta.outputs.update-type }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # A "minor" base image bump (python 3.12 -> 3.13, nginx 1.30 -> 1.31) can break the runtime: keep it manual.
+          case "$ECO:$TYPE" in
+            docker*:version-update:semver-patch|docker*:) ok=1 ;;
+            docker*:*) ok=0 ;;
+            *:version-update:semver-patch|*:version-update:semver-minor) ok=1 ;;
+            *) ok=0 ;;
+          esac
+          if [ "$ok" = 1 ]; then
+            gh pr merge --auto --squash "$PR_URL"
+          else
+            echo "Left for manual review: $ECO $TYPE"
+          fi

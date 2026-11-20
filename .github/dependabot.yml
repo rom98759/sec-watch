@@ -1,22 +1,19 @@
+# Weekly, one grouped PR per ecosystem for patch/minor (auto-merged when CI is green);
+# majors come as separate PRs and stay manual.
 version: 2
 updates:
   - package-ecosystem: github-actions
     directory: /
-    schedule:
-      interval: weekly
-    commit-message:
-      prefix: ci
-
+    schedule: { interval: weekly, day: monday }
+    open-pull-requests-limit: 5
+    groups: { github_actions: { update-types: [minor, patch] } }
   - package-ecosystem: docker
     directory: /watcher
-    schedule:
-      interval: weekly
-    commit-message:
-      prefix: build
-
+    schedule: { interval: weekly, day: monday }
+    open-pull-requests-limit: 5
+    groups: { docker: { update-types: [minor, patch] } }
   - package-ecosystem: docker-compose
     directory: /
-    schedule:
-      interval: weekly
-    commit-message:
-      prefix: build
+    schedule: { interval: weekly, day: monday }
+    open-pull-requests-limit: 5
+    groups: { docker_compose: { update-types: [minor, patch] } }
