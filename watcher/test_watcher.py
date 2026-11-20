@@ -18,6 +18,8 @@ def make_cfg(**overrides) -> w.Config:
         weekly_day=0,
         github_interval_min=60,
         dry_run=True,
+        notify_all=True,
+        dismiss_dev=False,
     )
     base.update(overrides)
     return w.Config(**base)
@@ -164,8 +166,10 @@ class ScheduleTest(unittest.TestCase):
         self.assertFalse(github)
 
 
-def alert(repo: str, number: int, severity: str = "HIGH", package: str = "next", patched: str = "") -> w.Alert:
-    return w.Alert(repo, number, severity, package, f"bug {number}", f"https://gh/{repo}/a/{number}", patched)
+def alert(repo: str, number: int, severity: str = "HIGH", package: str = "next", patched: str = "",
+          scope: str = "runtime", cve: str = "") -> w.Alert:
+    return w.Alert(repo, number, severity, package, f"bug {number}", f"https://gh/{repo}/a/{number}", patched,
+                   scope, cve)
 
 
 def pr(repo: str, number: int, title: str = "Bump next from 14 to 15", body: str = "") -> w.PullRequest:
@@ -419,3 +423,127 @@ class StateTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UrgencyTest(unittest.TestCase):
+    def test_critical_or_known_exploited_is_urgent(self):
+        self.assertTrue(w.is_urgent("CRITICAL", "", set()))
+        self.assertTrue(w.is_urgent("HIGH", "CVE-9", {"CVE-9"}))
+        self.assertFalse(w.is_urgent("HIGH", "CVE-8", {"CVE-9"}))
+        self.assertFalse(w.is_urgent("HIGH", "", {""}))
+
+    def test_dev_scope_is_noise_unless_critical(self):
+        self.assertTrue(w.is_noise(alert("o/r", 1, "HIGH", scope="development")))
+        self.assertFalse(w.is_noise(alert("o/r", 1, "CRITICAL", scope="development")))
+        self.assertFalse(w.is_noise(alert("o/r", 1, "HIGH")))
+
+
+class UrgentOnlyGithubTest(unittest.TestCase):
+    def setUp(self):
+        self.sent: list[list[dict]] = []
+        self._orig = (w.send_embeds, w.fetch_github, w.fetch_pr_state, w.load_kev)
+        w.send_embeds = lambda cfg, embeds: self.sent.append(embeds)
+        w.fetch_pr_state = lambda cfg, key: "merged"
+        w.load_kev = lambda: {"CVE-KEV"}
+        self.cfg = make_cfg(notify_all=False)
+
+    def tearDown(self):
+        w.send_embeds, w.fetch_github, w.fetch_pr_state, w.load_kev = self._orig
+
+    def fetch(self, alerts, prs):
+        w.fetch_github = lambda cfg: ({a.key: a for a in alerts}, {p.key: p for p in prs}, 3)
+
+    def test_hourly_check_sends_only_urgent_alerts(self):
+        state = w.State()
+        self.fetch([alert("o/r", 1)], [pr("o/r", 5)])
+        w.run_github(self.cfg, state)
+        self.sent.clear()
+
+        # new HIGH alert, new PR, merged PR: all routine, nothing sent
+        self.fetch([alert("o/r", 1), alert("o/r", 2)], [pr("o/r", 6)])
+        w.run_github(self.cfg, state)
+        self.assertEqual(self.sent, [])
+
+        self.fetch([alert("o/r", 1), alert("o/r", 2), alert("o/r", 3, "CRITICAL"), alert("o/x", 4, cve="CVE-KEV")],
+                   [pr("o/r", 6)])
+        w.run_github(self.cfg, state)
+        (cards,) = self.sent
+        self.assertEqual([c["title"] for c in cards], ["o/r", "o/x"])
+        self.assertIn("https://gh/o/r/a/3", text(cards))
+        self.assertNotIn("https://gh/o/r/a/2", text(cards))
+        self.assertNotIn("Mergée", text(cards))
+
+    def test_weekly_digest_lists_open_alerts_and_prs(self):
+        self.fetch([alert("o/r", 1, "HIGH"), alert("o/q", 2, "MEDIUM")], [pr("o/p", 3)])
+        w.github_digest(self.cfg)
+        (cards,) = self.sent
+        self.assertIn("Résumé hebdo GitHub", cards[0]["title"])
+        self.assertEqual([c["title"] for c in cards[1:]], ["o/r", "o/q", "o/p"])
+
+
+class FetchGithubTest(unittest.TestCase):
+    def setUp(self):
+        self._orig = (w.gh_get_all, w.dismiss_alert)
+        self.dismissed: list[str] = []
+        w.dismiss_alert = lambda cfg, a: self.dismissed.append(a.key)
+
+        def get_all(cfg, path):
+            if path.startswith("/user/repos"):
+                return [{"full_name": "o/r", "archived": False}]
+            if "dependabot/alerts" in path:
+                return [self.raw(1, "high", "development"), self.raw(2, "high", "runtime"),
+                        self.raw(3, "critical", "development")]
+            return []
+
+        w.gh_get_all = get_all
+
+    def tearDown(self):
+        w.gh_get_all, w.dismiss_alert = self._orig
+
+    @staticmethod
+    def raw(number: int, severity: str, scope: str) -> dict:
+        return {"number": number, "html_url": f"https://gh/{number}",
+                "security_advisory": {"severity": severity, "summary": "s", "cve_id": f"CVE-{number}"},
+                "security_vulnerability": {"first_patched_version": {"identifier": "1.0"}},
+                "dependency": {"package": {"name": "pkg"}, "scope": scope}}
+
+    def test_dev_scope_alerts_are_dropped_and_dismissed(self):
+        alerts, _, _ = w.fetch_github(make_cfg(dismiss_dev=True, dry_run=False))
+        self.assertEqual(sorted(alerts), ["o/r#2", "o/r#3"])
+        self.assertEqual(alerts["o/r#2"].cve, "CVE-2")
+        self.assertEqual(self.dismissed, ["o/r#1"])
+
+    def test_no_dismissal_unless_enabled(self):
+        alerts, _, _ = w.fetch_github(make_cfg())
+        self.assertEqual(sorted(alerts), ["o/r#2", "o/r#3"])
+        self.assertEqual(self.dismissed, [])
+
+    def test_dry_run_never_dismisses(self):
+        w.fetch_github(make_cfg(dismiss_dev=True, dry_run=True))
+        self.assertEqual(self.dismissed, [])
+
+
+class UrgentOnlyTrivyTest(unittest.TestCase):
+    def setUp(self):
+        self.sent: list[list[dict]] = []
+        self._orig = (w.send_embeds, w.running_images, w.scan_image, w.update_trivy_db, w.load_kev)
+        w.send_embeds = lambda cfg, embeds: self.sent.append(embeds)
+        w.running_images = lambda cfg: ["app:1"]
+        w.update_trivy_db = lambda cfg: None
+        w.scan_image = lambda cfg, image: w.parse_trivy(TRIVY_REPORT)
+        w.load_kev = lambda: set()
+
+    def tearDown(self):
+        w.send_embeds, w.running_images, w.scan_image, w.update_trivy_db, w.load_kev = self._orig
+
+    def test_nightly_scan_sends_only_urgent_cves(self):
+        state = w.State(trivy_bootstrapped=True)
+        w.run_trivy(make_cfg(notify_all=False), state, weekly=False)
+        (cards,) = self.sent
+        self.assertIn("openssl", text(cards))
+        self.assertNotIn("zlib", text(cards))
+
+    def test_nothing_urgent_sends_nothing(self):
+        state = w.State(trivy_bootstrapped=True, trivy_seen={"app:1": ["CVE-1|openssl"]})
+        w.run_trivy(make_cfg(notify_all=False), state, weekly=False)
+        self.assertEqual(self.sent, [])

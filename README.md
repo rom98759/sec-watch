@@ -11,16 +11,20 @@ GitHub repositories, without opening five dashboards.
 
 **Status:** running on my own VPS. Python stdlib only, Docker Compose.
 
-It posts to one Discord channel when:
+It interrupts you only for what is **urgent** — CRITICAL, or listed in CISA's
+[Known Exploited Vulnerabilities](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) catalog —
+and keeps everything else for a Monday digest:
 
-| Source | Trigger | Tool |
-|---|---|---|
-| Running containers | A newer image is published for a tag in use | [Diun](https://crazymax.dev/diun/) |
-| Running containers | A **new** fixable CRITICAL/HIGH CVE appears in an image in use (nightly) | [Trivy](https://trivy.dev) |
-| Running containers | Weekly summary of all open fixable CVEs (Mondays) | Trivy |
-| GitHub repositories | A new Dependabot security alert is opened | GitHub API |
-| GitHub repositories | Dependabot opens a pull request | GitHub API |
-| GitHub repositories | A Dependabot PR is merged or closed, alerts get resolved | GitHub API |
+| Source | Right away | Monday digest | Tool |
+|---|---|---|---|
+| Running containers | A newer image is published for a tag in use | — | [Diun](https://crazymax.dev/diun/) |
+| Running containers | A **new** fixable CVE that is urgent (nightly scan) | All open fixable CRITICAL/HIGH CVEs | [Trivy](https://trivy.dev) |
+| GitHub repositories | A new urgent Dependabot alert | Every open alert and every Dependabot PR still open | GitHub API |
+
+Alerts on development-only dependencies (build and test tooling) are ignored unless critical,
+and dismissed on GitHub when `DISMISS_DEV_ALERTS=1`. Dependabot PRs are expected to be auto-merged
+by each repository, so the digest lists only the ones left for a human. `NOTIFY_ALL=1` restores
+the original behaviour (every new finding, PR and merge is posted).
 
 Only new findings are notified; the state is kept in a named volume.
 
@@ -83,6 +87,8 @@ docker compose run --rm watcher --once weekly
 | `WEEKLY_DAY` | `0` | Day of the weekly summary (0 = Monday) |
 | `GITHUB_INTERVAL_MIN` | `60` | GitHub polling interval |
 | `DRY_RUN` | empty | `1` prints messages to the logs instead of Discord |
+| `NOTIFY_ALL` | empty | `1` posts every new finding, not only urgent ones |
+| `DISMISS_DEV_ALERTS` | empty | `1` dismisses non-critical alerts on development-only dependencies (token needs Dependabot alerts: write) |
 
 ## Development
 
