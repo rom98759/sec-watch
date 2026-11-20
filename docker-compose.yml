@@ -51,6 +51,7 @@ services:
     env_file: .env
     environment:
       DOCKER_HOST: tcp://socket-proxy:2375
+      DISMISS_DEV_ALERTS: "1"
     volumes:
       - watcher-data:/data
     networks: [docker-api, egress]

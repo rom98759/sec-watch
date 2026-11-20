@@ -51,6 +51,10 @@ class Config:
     weekly_day: int
     github_interval_min: int
     dry_run: bool
+    # False: only urgent findings (CRITICAL or known-exploited) are sent right away, the rest
+    # waits for the Monday digest. True: every change is sent (original behaviour).
+    notify_all: bool = False
+    dismiss_dev: bool = False
 
     @classmethod
     def from_env(cls, dry_run: bool) -> Config:
@@ -66,6 +70,8 @@ class Config:
             weekly_day=int(os.environ.get("WEEKLY_DAY", "0")),
             github_interval_min=int(os.environ.get("GITHUB_INTERVAL_MIN", "60")),
             dry_run=dry_run or os.environ.get("DRY_RUN", "") == "1",
+            notify_all=os.environ.get("NOTIFY_ALL", "") == "1",
+            dismiss_dev=os.environ.get("DISMISS_DEV_ALERTS", "") == "1",
         )
 
 
@@ -288,8 +294,13 @@ def run_trivy(cfg: Config, state: State, weekly: bool) -> None:
         send_embeds(cfg, scan_summary_cards("🐳 Premier scan Trivy", results, errors, cfg.severities))
     else:
         cards = []
+        kev = set() if cfg.notify_all else load_kev()
         for image, vulns in results.items():
-            if fresh := new_findings(state.trivy_seen.get(image, []), vulns):
+            fresh = new_findings(state.trivy_seen.get(image, []), vulns)
+            if not cfg.notify_all:
+                # the rest is in Monday's summary
+                fresh = [v for v in fresh if is_urgent(v.severity, v.id, kev)]
+            if fresh:
                 cards.append(new_cve_card(image, fresh, len(vulns)))
         if errors:
             cards.append(card("⚠️ Scan incomplet", "", SEVERITY_COLOR["LOW"], [field("Erreurs", fit(errors))],
@@ -310,6 +321,32 @@ def run_trivy(cfg: Config, state: State, weekly: bool) -> None:
     # would report every existing CVE as new.
     if results:
         state.trivy_bootstrapped = True
+
+
+# --- Urgency -----------------------------------------------------------------
+
+KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+_kev_cache: tuple[float, set[str]] = (0.0, set())
+
+
+def load_kev() -> set[str]:
+    """CVE ids from CISA's Known Exploited Vulnerabilities catalog, refreshed every 12 h."""
+    global _kev_cache
+    fetched_at, ids = _kev_cache
+    if time.time() - fetched_at < 12 * 3600:
+        return ids
+    try:
+        body, _ = fetch_json(urllib.request.Request(KEV_URL, headers={"User-Agent": "sec-watch"}))
+        ids = {v["cveID"] for v in body["vulnerabilities"]}  # type: ignore[index]
+        _kev_cache = (time.time(), ids)
+    except (urllib.error.URLError, http.client.HTTPException, TimeoutError, ConnectionError, KeyError, ValueError) as e:
+        # keep the previous list: CRITICAL findings are still urgent without it
+        log.warning("KEV catalog unavailable: %s", e)
+    return ids
+
+
+def is_urgent(severity: str, cve: str, kev: set[str]) -> bool:
+    return severity == "CRITICAL" or (bool(cve) and cve in kev)
 
 
 # --- GitHub ------------------------------------------------------------------
@@ -350,6 +387,8 @@ class Alert:
     summary: str
     url: str
     patched: str = ""
+    scope: str = "runtime"
+    cve: str = ""
 
     @property
     def key(self) -> str:
@@ -390,8 +429,27 @@ def gh_get_all(cfg: Config, path: str) -> list[dict]:
     return items
 
 
+def is_noise(alert: Alert) -> bool:
+    """Dev-only dependency (build/test tooling, never shipped): not worth a notification unless critical."""
+    return alert.scope == "development" and alert.severity != "CRITICAL"
+
+
+def dismiss_alert(cfg: Config, alert: Alert) -> None:
+    body = json.dumps({"state": "dismissed", "dismissed_reason": "tolerable_risk",
+                       "dismissed_comment": "sec-watch: development-only dependency"}).encode()  # fmt: skip
+    req = gh_request(cfg, f"https://api.github.com/repos/{alert.repo}/dependabot/alerts/{alert.number}")
+    req.method, req.data = "PATCH", body
+    req.add_header("Content-Type", "application/json")
+    try:
+        urllib.request.urlopen(req, timeout=30).close()
+        log.info("dismissed dev-only alert %s", alert.key)
+    except urllib.error.HTTPError as e:
+        # 403: the token can read alerts but not write them; the alert is still filtered out
+        log.warning("could not dismiss %s: HTTP %s", alert.key, e.code)
+
+
 def fetch_github(cfg: Config) -> tuple[dict[str, Alert], dict[str, PullRequest], int]:
-    """Return ({key: alert}, {key: dependabot PR}, repo_count) for open items."""
+    """Return ({key: alert}, {key: dependabot PR}, repo_count) for open items, dev-only noise excluded."""
     repos = [r for r in gh_get_all(cfg, "/user/repos?affiliation=owner&per_page=100") if not r["archived"]]
     alerts: dict[str, Alert] = {}
     prs: dict[str, PullRequest] = {}
@@ -402,7 +460,12 @@ def fetch_github(cfg: Config) -> tuple[dict[str, Alert], dict[str, PullRequest],
                 adv = a["security_advisory"]
                 patched = (a.get("security_vulnerability") or {}).get("first_patched_version") or {}
                 alert = Alert(name, a["number"], adv["severity"].upper(), a["dependency"]["package"]["name"],
-                              adv["summary"], a["html_url"], patched.get("identifier", ""))  # fmt: skip
+                              adv["summary"], a["html_url"], patched.get("identifier", ""),
+                              a["dependency"].get("scope") or "runtime", adv.get("cve_id") or "")  # fmt: skip
+                if is_noise(alert):
+                    if cfg.dismiss_dev:
+                        dismiss_alert(cfg, alert)
+                    continue
                 alerts[alert.key] = alert
         except urllib.error.HTTPError as e:
             # 403/404: Dependabot alerts disabled or not granted to the token
@@ -583,11 +646,12 @@ def update_card(
     return card(repo, security_url(repo), color, fields, footer)
 
 
-def header_card(repo_count: int, alerts_by_repo: dict[str, list[Alert]], pr_count: int) -> dict:
+def header_card(repo_count: int, alerts_by_repo: dict[str, list[Alert]], pr_count: int,
+                title: str = "🛡️ Veille GitHub démarrée") -> dict:  # fmt: skip
     all_alerts = [a for repo_alerts in alerts_by_repo.values() for a in repo_alerts]
     top = sorted(alerts_by_repo.items(), key=lambda kv: -len(kv[1]))
     return card(
-        "🛡️ Veille GitHub démarrée",
+        title,
         "https://github.com/settings/security_analysis",
         NEUTRAL_COLOR,
         [
@@ -612,8 +676,8 @@ def closed_pr_state(cfg: Config, key: str) -> str:
         return "closed"
 
 
-def run_github(cfg: Config, state: State) -> None:
-    alerts, prs, repo_count = fetch_github(cfg)
+def overview_cards(alerts: dict[str, Alert], prs: dict[str, PullRequest], repo_count: int, title: str) -> list[dict]:
+    """Header card, then one card per repo with open alerts or Dependabot PRs, worst first."""
     alerts_by_repo: dict[str, list[Alert]] = {}
     for a in alerts.values():
         alerts_by_repo.setdefault(a.repo, []).append(a)
@@ -621,22 +685,42 @@ def run_github(cfg: Config, state: State) -> None:
     for p in prs.values():
         prs_by_repo.setdefault(p.repo, []).append(p)
 
+    def rank(repo: str) -> tuple[int, int, str]:
+        repo_alerts = alerts_by_repo.get(repo, [])
+        return SEVERITY_ORDER.get(worst_severity(repo_alerts) or "", 9), -len(repo_alerts), repo
+
+    repos = sorted(alerts_by_repo.keys() | prs_by_repo.keys(), key=rank)
+    cards = [repo_card(r, alerts_by_repo.get(r, []), prs_by_repo.get(r, [])) for r in repos]
+    return [header_card(repo_count, alerts_by_repo, len(prs), title), *cards]
+
+
+def github_digest(cfg: Config) -> None:
+    """Monday digest: everything still open (PRs left open are the ones auto-merge did not take)."""
+    alerts, prs, repo_count = fetch_github(cfg)
+    send_embeds(cfg, overview_cards(alerts, prs, repo_count, "📋 Résumé hebdo GitHub"))
+
+
+def run_github(cfg: Config, state: State) -> None:
+    alerts, prs, repo_count = fetch_github(cfg)
+    alerts_by_repo: dict[str, list[Alert]] = {}
+    for a in alerts.values():
+        alerts_by_repo.setdefault(a.repo, []).append(a)
+
     if not state.github_bootstrapped:
-
-        def rank(repo: str) -> tuple[int, int, str]:
-            repo_alerts = alerts_by_repo.get(repo, [])
-            return SEVERITY_ORDER.get(worst_severity(repo_alerts) or "", 9), -len(repo_alerts), repo
-
-        repos = sorted(alerts_by_repo.keys() | prs_by_repo.keys(), key=rank)
-        cards = [repo_card(r, alerts_by_repo.get(r, []), prs_by_repo.get(r, [])) for r in repos]
-        send_embeds(cfg, [header_card(repo_count, alerts_by_repo, len(prs)), *cards])
+        send_embeds(cfg, overview_cards(alerts, prs, repo_count, "🛡️ Veille GitHub démarrée"))
         state.github_bootstrapped = True
     else:
         known_alerts, known_prs = set(state.github_alerts), set(state.github_prs)
         new_alerts = [a for k, a in alerts.items() if k not in known_alerts]
         new_prs = [p for k, p in prs.items() if k not in known_prs]
         resolved = sorted(known_alerts - alerts.keys())
-        closed = [(k, closed_pr_state(cfg, k)) for k in sorted(known_prs - prs.keys())]
+        if cfg.notify_all:
+            closed = [(k, closed_pr_state(cfg, k)) for k in sorted(known_prs - prs.keys())]
+        else:
+            # PRs are auto-merged and routine alerts wait for the digest: only urgent alerts interrupt
+            kev = load_kev()
+            new_alerts = [a for a in new_alerts if is_urgent(a.severity, a.cve, kev)]
+            new_prs, resolved, closed = [], [], []
 
         changed = {a.repo for a in new_alerts} | {p.repo for p in new_prs}
         changed |= {repo_of(k) for k in resolved} | {repo_of(k) for k, _ in closed}
@@ -760,6 +844,8 @@ def main() -> int:
             run_github(cfg, state)
         else:
             run_trivy(cfg, state, weekly=args.once == "weekly")
+            if args.once == "weekly" and cfg.github_token:
+                github_digest(cfg)
         persist(cfg, state)
         return 0
 
@@ -778,6 +864,8 @@ def main() -> int:
             state.trivy_last_scan = dt.date.today().isoformat()
             if weekly_due:
                 state.trivy_last_weekly = state.trivy_last_scan
+                if cfg.github_token:
+                    run_task("github digest", lambda: github_digest(cfg), cfg)
             persist(cfg, state)
         time.sleep(60)
 
